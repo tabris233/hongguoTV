@@ -21,9 +21,10 @@
 const crypto = require('node:crypto');
 
 const SITE = 'https://hongguoduanju.com';
-const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/';
+// 旧入口 video_model / multi_video_model 2026-10 起返回 200 空体，preload 是唯一还吐数据的入口。
+const VIDEO_API = 'https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/preload/v1/';
 const APP_SEARCH_API = 'https://api5-normal-sinfonlinea.fqnovel.com/reading/bookapi/search/tab/v';
-const VIDEO_UA = 'com.phoenix.read/71332 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
+const VIDEO_UA = 'com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)';
 const APP_UA = 'com.phoenix.read/72232 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3)';
 const DEVICE = {
     iid: '1905892595382586', device_id: '1905892595378490', ac: 'wifi', channel: 'update_64', aid: '8662', app_name: 'novelread',
@@ -422,16 +423,36 @@ async function signedAppGet(values) {
 
 function videoModelUrl() { const query = new URLSearchParams({ ...DEVICE }); return `${VIDEO_API}?${query}`; }
 
+// 取流设备号：[1e18, 9e18) 随机生成、进程内复用（onedrama 6905554 同款口径）。
+function streamRandomId() { return String(1000000000000000000n + (BigInt(Math.floor(Math.random() * 0x100000000)) * 4294967296n + BigInt(Math.floor(Math.random() * 0x100000000))) % 8000000000000000000n); }
+const STREAM_DEVICE_ID = streamRandomId();
+const STREAM_INSTALL_ID = streamRandomId();
+
+// 老版 X-Gorgon(0x40 0x1c)：md5(query) 前 4 字节 + md5(body) 前 4 字节 + 4 零 + [0,6,11,28] + ts(BE)，
+// 异或 20 字节固定密钥后按位循环混淆。与 xGorgon 的 0x8404 随机变体不同。
+function legacyGorgon(query, body, khronos) {
+    const digest = (value) => crypto.createHash('md5').update(value).digest();
+    const input = Buffer.concat([digest(Buffer.from(query)).subarray(0, 4), digest(body).subarray(0, 4), Buffer.alloc(4), Buffer.from([0, 6, 11, 28]), be32(khronos)]);
+    const key = Buffer.from([0x44, 0xb9, 0xb9, 0xd9, 0xa4, 0xae, 0xf9, 0xfc, 0xa4, 0x93, 0xaa, 0x75, 0x7c, 0xa3, 0xc2, 0xc4, 0xa4, 0x96, 0x93, 0x8f]);
+    const out = Buffer.from(input.map((value, index) => value ^ key[index]));
+    for (let i = 0; i < 20; i += 1) {
+        const value = ((out[i] >> 4) | (out[i] << 4)) & 255;
+        out[i] = (reverseBits(out[(i + 1) % 20] ^ value) ^ 0xff ^ 20) & 255;
+    }
+    return Buffer.concat([Buffer.from([0x84, 0x04, 0x40, 0x1c, 0, 0]), out]).toString('hex');
+}
+
+// preload 取流的风控只放行 onedrama 6905554 同款简化请求：精简 query（无 ts）+ 老版 X-Gorgon，
+// 不带 x-ladon/x-argus/x-helios/x-medusa；完整签名套件会被判成风控，返回 HTTP 200 + 空响应体。
 function signedVideoRequest(payload) {
-    const khronos = Math.floor(Date.now() / 1000); const body = Buffer.from(payload); const ticketBase = Date.now(); let requestTicket = ticketBase; let query = ''; let url = '';
-    // branch 1 的签名变体服务端不认：抖动 _rticket 找一个可用的 branch（最多试 32 秒偏移）
-    for (let offset = 0; offset < 32; offset += 1) { requestTicket = ticketBase + offset; const values = { ...DEVICE, ts: String(khronos), _rticket: String(requestTicket) }; query = pythonUrlEncode(values); url = `${VIDEO_API}?${query}`; if (branchOf(url, body, khronos) !== 1) break; }
-    const random = Math.floor(Math.random() * 65536); const headers = {
-        'User-Agent': VIDEO_UA, Accept: 'application/json; charset=utf-8,application/x-protobuf', 'Content-Type': 'application/json; charset=UTF-8',
-        'x-xs-from-web': '0', 'x-ss-req-ticket': String(requestTicket), 'x-tt-request-tag': 't=0;n=0', 'sdk-version': '2', 'passport-sdk-version': '50561',
-        'x-vc-bdturing-sdk-version': '3.7.2.cn', 'x-ss-stub': md5(body), 'x-gorgon': xGorgon(query, body, khronos, random),
-        'x-khronos': String(khronos), 'x-ladon': be32(khronos).toString('base64'), 'x-argus': le32(khronos).toString('base64'),
-        'x-helios': helios(khronos), 'x-medusa': buildMedusa(url, body, khronos), 'x-tt-dt': '',
+    const khronos = Math.floor(Date.now() / 1000); const body = Buffer.from(payload); const ticket = Date.now();
+    const values = { aid: '8662', app_name: 'novelread', version_code: '73532', version_name: '7.3.5.32', manifest_version_code: '73532', update_version_code: '73532', channel: 'update_64', device_platform: 'android', os: 'android', ssmix: 'a', device_type: '25053RT47C', device_brand: 'Redmi', language: 'zh', os_api: '36', os_version: '16', resolution: '1280*2772', dpi: '520', ac: 'wifi', device_id: STREAM_DEVICE_ID, iid: STREAM_INSTALL_ID, _rticket: String(ticket) };
+    const query = pythonUrlEncode(values);
+    const url = `${VIDEO_API}?${query}`;
+    const headers = {
+        'User-Agent': VIDEO_UA, Accept: 'application/json', 'Content-Type': 'application/json; charset=UTF-8',
+        'x-xs-from-web': '0', 'sdk-version': '2', 'x-khronos': String(khronos),
+        'x-gorgon': legacyGorgon(query, body, khronos), 'x-ss-req-ticket': String(ticket), 'x-ss-stub': md5(body),
     };
     return { url, headers, body };
 }
@@ -449,8 +470,8 @@ async function requestVideoModel(vid) {
 }
 
 function modelForVideo(data, vid) {
-    const map = data?.data || {};
-    const entry = map[str(vid)] || Object.values(map).find((value) => value && typeof value === 'object');
+    // preload 是批量接口：data 以 vid 为键，只认请求的那一集，不拿其他条目顶上。
+    const entry = (data?.data || {})[str(vid)];
     if (!entry) throw new Error('video_model 没有对应视频');
     const model = typeof entry.video_model === 'string' ? jsonBody(entry.video_model) : entry.video_model;
     if (!model) throw new Error('video_model 内容为空');

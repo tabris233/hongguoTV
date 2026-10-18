@@ -27,6 +27,9 @@ class SearchSessionExpiredException: IOException("搜索结果已过期，请从
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
     private val signer = Signer()
     private val site = "https://hongguoduanju.com"
+    // 取流设备号：[1e18, 9e18) 随机生成、进程内复用（onedrama 6905554 同款口径）。
+    private val streamDeviceId=(1_000_000_000_000_000_000L+kotlin.random.Random.nextLong(8_000_000_000_000_000_000L)).toString()
+    private val streamInstallId=(1_000_000_000_000_000_000L+kotlin.random.Random.nextLong(8_000_000_000_000_000_000L)).toString()
     private data class SearchCursor(val searchId: String, val passback: String, val offset: Int?, val updatedAt: Long)
     private val searchCursors=linkedMapOf<Triple<ContentType,String,Int>,SearchCursor>()
     private fun text(url: String, signed: Signer.Request? = null): String {
@@ -126,11 +129,27 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
-        val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
-        val data=JSONObject(text(signed.url,signed))
-        if(data.optInt("Code",data.optInt("code",0))!=0) throw IOException("播放接口暂不可用")
+        // 旧入口 video_model / multi_video_model 2026-10 起返回 200 空体，preload 是唯一还吐数据的入口；
+        // 其风控只放行 onedrama 6905554 同款简化请求：精简 query + 老版 X-Gorgon，不带 ladon/argus/medusa。
+        val values=linkedMapOf(
+            "aid" to "8662","app_name" to "novelread",
+            "version_code" to "73532","version_name" to "7.3.5.32",
+            "manifest_version_code" to "73532","update_version_code" to "73532",
+            "channel" to "update_64","device_platform" to "android","os" to "android",
+            "ssmix" to "a","device_type" to "25053RT47C","device_brand" to "Redmi",
+            "language" to "zh","os_api" to "36","os_version" to "16",
+            "resolution" to "1280*2772","dpi" to "520","ac" to "wifi",
+            "device_id" to streamDeviceId,"iid" to streamInstallId
+        )
+        val signed=signer.signSimple("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/preload/v1/",values,payload)
+        val resp=text(signed.url,signed)
+        if(resp.isBlank()) throw IOException("播放接口未返回有效数据，请稍后再试")
+        val data=JSONObject(resp)
+        val code=data.optInt("Code",data.optInt("code",0))
+        if(code!=0) throw IOException("播放接口暂不可用（$code）")
         val map=data.optJSONObject("data") ?: throw IOException("播放信息为空")
-        val entry=map.optJSONObject(id) ?: map.keys().asSequence().mapNotNull { map.optJSONObject(it) }.firstOrNull() ?: throw IOException("播放信息为空")
+        // preload 是批量接口：data 以 vid 为键，只认请求的那一集，不拿其他条目顶上。
+        val entry=map.optJSONObject(id) ?: throw IOException("播放信息为空")
         val model=entry.optJSONObject("video_model") ?: JSONObject(entry.str("video_model"))
         val raw=model.opt("fallback_api")
         val fallback=when(raw) { is JSONObject -> raw.str("fallback_api"); is JSONArray -> raw.optString(0); else -> runCatching { JSONObject(raw.toString()).str("fallback_api") }.getOrDefault(raw.toString()) }

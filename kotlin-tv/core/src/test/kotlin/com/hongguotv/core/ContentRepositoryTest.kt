@@ -42,6 +42,24 @@ class ContentRepositoryTest {
         assertEquals("720P",repo.stream("123",720).quality)
     }
 
+    @Test fun streamRequestsPreloadEndpoint() {
+        val paths=mutableListOf<String>()
+        val repo=repository { request ->
+            paths.add(request.url.encodedPath)
+            if(request.url.host=="example.com") JSONObject().put("video_info",JSONObject().put("data",JSONObject().put("video_list",JSONObject().put("v0",JSONObject().put("vheight",1080).put("codec_type","h264").put("main_url","https://example.com/a.mp4"))))).toString()
+            else """{"data":{"123":{"video_model":{"fallback_api":"https://example.com/stream"}}}}"""
+        }
+        val result=repo.stream("123")
+        assertEquals("/novel/player/multi_video_model/preload/v1/",paths.first())
+        assertEquals("https://example.com/a.mp4",result.url)
+    }
+
+    @Test fun emptyPreloadBodyFailsWithClearError() {
+        val repo=repository { "" }
+        val e=assertThrows(IOException::class.java) { repo.stream("123") }
+        assertEquals("播放接口未返回有效数据，请稍后再试",e.message)
+    }
+
     private fun repository(clock: () -> Long = System::currentTimeMillis, respond: (Request) -> String) = ContentRepository(
         OkHttpClient.Builder().addInterceptor { chain ->
             Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
